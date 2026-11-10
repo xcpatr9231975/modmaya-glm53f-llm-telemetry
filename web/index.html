@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<!--
+  maya-glm53flash-telemetry — physical weight atlas + live telemetry.
+  Single page, zero dependencies. Requires: WebGL2 (Chrome/FF), atlas_data.js
+  (from tools/build_atlas.py), and telemetry.json (from collect/collector.py;
+  served mode exposes it at /api/telemetry).
+
+  Layout: fullscreen WebGL2 canvas (the atlas) + DOM HUD overlays:
+    top-left  : engine phase, tok/s, prompt/output totals, DFlash2 accept,
+                expert residency (VRAM + RAM tiers of the 12,096 experts)
+    top-right : GPU (NVIDIA GB10 iGPU, NVML), unified memory, CPU/RAM,
+                storage, KV cache occupancy (int8 tokens, VRAM-resident)
+    bottom-left : rolling engine event log (log_parser.py event types)
+    bottom-mid  : forward-pass stage strip (EMB -> HC -> MLA/DSA -> HC ->
+                ROUTER -> 8/288 experts -> SHARED -> HEAD), driven by the
+                live token particle position in the WebGL scene
+    bottom-right : sparklines (VRAM hit %, tok/s, KV seq tokens)
+    hover     : expert cell -> layer, expert id, shard byte ranges from
+                native_experts.txt (gate/up/down regions, bytes/expert, bpw);
+                plate -> lit expert cells now; KV bar -> occupancy breakdown
+  In the scene: amber sheet = block the token head just visited (forward
+  pass), green/blue bar front-left = KV cache growth (32 cells = context).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GLM-5.3-Flash · Maya-S v2 IQ2_XXS — WebGL weight atlas + maya telemetry</title>
+<style>
+  :root{--fg:#c9d4e3;--dim:#5b6b82;--bg:#070a12;--acc:#39e0ff;--ok:#3fe07f;--warn:#ffb02e;}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font:12px/1.45 ui-monospace,"Cascadia Code",Menlo,monospace;overflow:hidden}
+  #gl{position:absolute;inset:0;width:100%;height:100%;display:block}
+  .hud{position:absolute;pointer-events:none;padding:8px 10px;border-radius:8px;
+    background:rgba(8,12,22,.78);border:1px solid #1c2740;backdrop-filter:blur(3px)}
+  #tl{top:10px;left:10px;min-width:300px}
+  #tr{top:10px;right:10px;min-width:280px}
+  #bt{bottom:10px;left:10px;right:10px;display:flex;gap:10px;align-items:stretch}
+  #bt .hud{position:static;flex:1}
+  #bt .hud.events{order:-1;flex:1.3;min-width:340px}
+  #bt .hud.sparks{order:1;flex:1;max-width:560px}
+  h1{font-size:13px;margin:0 0 6px;color:var(--acc);font-weight:600;letter-spacing:.4px}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:1px 10px}
+  .kv b{color:var(--dim);font-weight:400}
+  .big{font-size:20px;color:#fff}
+  .ok{color:var(--ok)} .warn{color:var(--warn)} .dim{color:var(--dim)}
+  canvas.spark{width:100%;height:46px;display:block}
+  #events{height:118px;overflow:hidden;font-size:11px;color:var(--dim);
+    display:flex;flex-direction:column-reverse}
+  #tip{position:absolute;display:none;max-width:380px;z-index:5}
+  #tip .name{color:#fff}
+  #legend{position:absolute;bottom:286px;right:10px;font-size:11px;color:var(--dim)}
+  #legend i{display:inline-block;width:9px;height:9px;margin-right:4px;vertical-align:-1px}
+  #help{position:absolute;top:10px;left:50%;transform:translateX(-50%);color:var(--dim);font-size:11px}
+  #fwd{position:absolute;bottom:286px;left:50%;transform:translateX(-50%);
+    display:flex;gap:3px;font-size:10.5px;white-space:nowrap}
+  #fwd .st{padding:2px 6px;border:1px solid #223052;border-radius:4px;color:#4d5d76;background:rgba(8,12,22,.55)}
+  #fwd .st.on{color:#0a0c14;background:#ffb02e;border-color:#ffd97a;font-weight:700}
+  #fwd .ar{color:#31405c;align-self:center}
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+
+<div id="tl" class="hud">
+  <h1>GLM-5.3 Flash · Maya-S v2 IQ2_XXS · modified-maya <span id="mver" class="dim"></span> · NVIDIA GB10 <span id="netstat" class="dim" style="font-size:11px"></span></h1>
+  <div class="kv">
+    <b>phase</b><span id="phase" class="big">idle</span>
+    <b>decode</b><span><span id="toks" class="big">0</span> tok/s
+       <span class="dim" id="generated"></span></span>
+    <b>prompt / out</b><span id="totals">0 / 0 tokens</span>
+    <b>prompt hit</b><span id="hit">–</span>
+    <b>DFlash2 drafts</b><span id="mtp">accepted / offered</span>
+    <b>expert residency</b><span id="ecache">–</span>
+    <b>experts called</b><span id="experts">–</span>
+    <b>tier traffic</b><span id="tiers">–</span>
+    <b>routing overlay</b><span class="warn">synthetic (API exposes no per-token expert ids)</span>
+  </div>
+</div>
+
+<div id="tr" class="hud">
+  <h1>hardware</h1>
+  <div class="kv">
+    <b>GPU</b><span id="gpu">–</span>
+    <b>VRAM</b><span id="vram">–</span>
+    <b>temp / power</b><span id="tp">–</span>
+    <b>CPU / RAM</b><span id="cram">–</span>
+    <b>storage</b><span id="storage">–</span>
+    <b>KV cache</b><span id="kvc">–</span>
+    <b>KV resident</b><span id="kvres">–</span>
+    <b>spend saved</b><span id="savings">–</span>
+  </div>
+</div>
+
+<div id="fwd"></div>
+
+<div id="help">drag&nbsp;orbit · wheel&nbsp;zoom · right-drag&nbsp;pan · click&nbsp;pick · r&nbsp;reset</div>
+
+<div id="legend" class="hud">
+  <div><i style="background:#1ad9f2"></i>MLA attention layer (11)</div>
+  <div><i style="background:#d940e6"></i>DSA layer (sparse indexer, 34)</div>
+  <div><i style="background:#27405f"></i>expert cell (colour = profile heat)</div>
+  <div><i style="background:#ffb80d"></i>routed active this token (synthetic top-8)</div>
+  <div><i style="background:#cfe28a"></i>token particle · <i style="background:#40e673"></i>DFlash2 draft loop</div>
+  <div><i style="background:#40e673"></i>NextN draft plate (blk.45)</div>
+  <div><i style="background:#b07c14"></i>block glow = token head just visited (forward pass)</div>
+  <div><i style="background:#1acc59"></i>KV cell: VRAM-resident · <i style="background:#4073d9"></i>streamed from RAM</div>
+</div>
+
+<div id="bt" class="hud">
+  <div class="hud events">
+    <h1>engine events</h1>
+    <div id="events"></div>
+  </div>
+  <div class="hud sparks">
+    <h1>sparklines</h1>
+    VRAM hit %<canvas id="sp1" class="spark"></canvas>
+    decode tok/s<canvas id="sp2" class="spark"></canvas>
+    KV seq tokens<canvas id="sp3" class="spark"></canvas>
+  </div>
+</div>
+
+<div id="tip" class="hud"></div>
+
+<script src="atlas_data.js"></script>
+<script src="atlas_gl.js"></script>
+<script>
+"use strict";
+/* ============================ boot ======================================= */
+const $=id=>document.getElementById(id);
+if(!window.ATLAS_META){document.body.innerHTML=
+  "<p style='padding:2em'>missing web/atlas_data.js — run: python3 tools/build_atlas.py</p>";throw 0;}
+const META=window.ATLAS_META, HEAT=window.ATLAS_HEAT;
+const cv=$("gl");
+let gl=null, glErr=null;
+try{ gl=new AtlasGL(cv,META,HEAT); }
+catch(e){ glErr=e.message||String(e); console.error("atlas GL init failed:",glErr);
+  cv.replaceWith(Object.assign(document.createElement("div"),{className:"nogl"}));
+  document.querySelector(".nogl").innerHTML=`<b>3-D scene unavailable</b> (${glErr}) — telemetry HUD still live below.`;
+  document.querySelector(".nogl").style.cssText="padding:1.2em;color:#f0a;font:12px monospace"; }
+const LTOT=META.dims.layers;
+
+/* ======================= telemetry polling =============================== */
+/* collector.py writes live/telemetry.json; served mode maps /api/telemetry. */
+let TEL={events:[]}, sp1=[], sp2=[], sp3=[], pollState="connecting…";
+async function poll(){
+  for(const u of ["api/telemetry","../live/telemetry.json","telemetry.json"]){
+    let tel=null;
+    try{
+      const r=await fetch(u,{cache:"no-store"}); if(!r.ok)continue;
+      tel=await r.json();
+    }catch(e){ continue; }             /* network failure: try next URL */
+    if(tel){
+      TEL=tel;
+      try{ if(gl) gl.setTelemetry(TEL); }             /* scene update */
+      catch(e){ console.error("setTelemetry:",e); }
+      try{ renderHud(); pollState="live"; }           /* HUD must run even without WebGL */
+      catch(e){ pollState="HUD error: "+(e.message||e); console.error("renderHud:",e); }
+      showNet();
+      return;
+    }
+  }
+  pollState="no telemetry yet (all fetch URLs failed)";
+}
+function showNet(){
+  const n=$("netstat");
+  if(n) n.textContent=" · "+pollState+(" ("+(TEL.ts?Math.max(0,Math.round(Date.now()/1000-TEL.ts))+"s ago":"–")+")");
+}
+setInterval(showNet,5000); showNet();
+/* ------------------------------------------------------------------ *
+ *  (a) forward-pass stage strip: chips for the block-internal pipeline.
+ *  gl.fwdStage is recomputed every animation frame from the position of
+ *  the token particle furthest along the embed->46 plates->head polyline.
+ * ------------------------------------------------------------------ */
+const fwdRow=$("fwd");
+const STAGES=AtlasGL.FWD_STAGES.map(s=>s==="EXPERTS"
+  ?`${META.dims.top_k_experts}/${META.dims.experts} experts`:s);
+const fwdChips=STAGES.map(s=>{
+  const sp=document.createElement("span"); sp.className="st"; sp.textContent=s; fwdRow.appendChild(sp); return sp;
+});
+fwdChips.forEach((c,i)=>{if(i){const d=document.createElement("span");d.className="ar";d.textContent="›";fwdRow.appendChild(d);}});
+setInterval(()=>{
+  const st=gl?gl.fwdStage:{name:"idle"};
+  fwdChips.forEach((c,i)=>c.classList.toggle("on", STAGES[i]===st.name));
+  fwdRow.title=st.layer>=0?`block ${st.layer} · ${st.label||""}`:(st.label||"idle");
+},120);
+
+setInterval(poll,1500); poll();
+
+const pct=x=>(100*x).toFixed(1)+"%";
+function renderHud(){
+  const live=TEL.live||{}, hw=TEL.hardware||{}, hws=TEL.hardware_static||{},
+        tot=TEL.totals||{}, eng=TEL.engine||{}, now=((TEL.tiers||{}).now)||{},
+        drv=TEL.derived||{}, gpu=TEL.gpu||{};
+  $("mver").textContent=eng.maya_version?("maya "+eng.maya_version):"";
+  $("phase").textContent=live.phase||live.state||"idle";
+  $("toks").textContent=(live.tok_s||now.tok_s||0).toFixed(1);
+  $("generated").textContent=live.generated?` · gen ${live.generated.toLocaleString()} tok`:"";
+  $("totals").textContent=`${(tot.prompt_tokens||0).toLocaleString()} in / ${(tot.output_tokens||0).toLocaleString()} out · ${TEL.requests_kept||0} kept`;
+  const hr=drv.prompt_hit_rate;
+  $("hit").textContent=hr!=null?pct(hr)+" hit":(tot.reused!=null?`${(tot.reused||0).toLocaleString()} reused`:"–");
+  const acc=now.draft_acc??((drv.mtp_accept_rate!=null)?Math.round(drv.mtp_accept_rate*100):null),
+        off=now.draft_off??null;
+  $("mtp").innerHTML=acc!=null?`<span class="ok">${acc}</span> / ${off??""}${off!=null?"":" %"} accepted${off!=null?` (${pct(acc/off)})`:""}`:"–";
+  $("ecache").innerHTML=`<span class="ok">${now.vram_used??eng.expert_slots??"–"}</span> / ${eng.expert_slots??"–"} VRAM · `
+    +`${now.ram_used??eng.ram_slots??"–"} RAM (${eng.ram_gb??"?"} GB pinned) of ${eng.experts??"12096"} experts`;
+  const ex=drv.experts||{};
+  $("experts").innerHTML=`<span class="ok">${ex.per_token_structural??"–"}</span> expert loads / tok (structural: `
+    +`43 MoE layers × top-${META.dims.top_k_experts} + shared)${ex.last_request_hit_pct!=null?` · cache hit ${ex.last_request_hit_pct}%`:""}`;
+  $("tiers").textContent=now.vram_hit!=null
+    ?`vram hit ${pct(now.vram_hit)} · ram ${now.ram_fetch??0}/tok · disk ${now.disk??0}/tok → promo ${now.promo??0}/tok`:"–";
+  $("gpu").textContent=(gpu.name||hws.gpu_name||"–");
+  if(gpu.total_gb!=null){
+    const used=gpu.total_gb-(gpu.free_gb||0);
+    $("vram").innerHTML=`<span class="${gpu.free_gb/gpu.total_gb<0.06?"warn":"ok"}">${used.toFixed(1)} / ${gpu.total_gb.toFixed(1)} GB</span>`
+      +(gpu.pool_gb?` · expert pool ${gpu.pool_gb.toFixed(1)} GB · drafter ${gpu.drafter_gb??"–"} GB`:"");
+  }else $("vram").textContent="–";
+  $("tp").textContent=hw.gpu_temp!=null?`${hw.gpu_temp.toFixed(0)} °C · ${(hw.gpu_power||0).toFixed(1)} W${hw.gpu_power_limit?` / ${hw.gpu_power_limit.toFixed(0)} W`:" (APU)"}`:"–";
+  $("cram").textContent=hw.cpu!=null?`${hw.cpu.toFixed(0)} % CPU · ${(hw.ram_used/(1<<30)).toFixed(1)} / ${(hw.ram_total/(1<<30)).toFixed(1)} GB (${hws.cpu_name||""}, ${hws.threads||"?"} threads)`:"–";
+  const st=TEL.storage||{};
+  $("storage").textContent=st.free!=null?`${(st.free/(1<<40)).toFixed(2)} TB free of ${(st.total/(1<<40)).toFixed(2)} TB`:"–";
+  /* (c) KV cache: engine.kv = dtype ("int8"), kv_resident = tokens whose KV
+     lives in VRAM, kv_ctx = per-sequence capacity, trained_context max. */
+  const kv=TEL.kv||{};
+  if(kv.capacity_tokens){
+    $("kvc").innerHTML=kv.seq_tokens!=null
+      ?`<span class="big" style="font-size:14px">${kv.seq_tokens.toLocaleString()}</span> / ${kv.capacity_tokens.toLocaleString()} tok · `
+       +`${kv.dtype||""} (${eng.kv_gb?eng.kv_gb+" GB":"–"})`:"–";
+    $("kvres").innerHTML=kv.resident_tokens!=null
+      ?`<span class="ok">${(kv.resident_tokens/kv.capacity_tokens*100).toFixed(0)}%</span> VRAM-resident (${kv.resident_tokens.toLocaleString()} tok) · trained ctx ${(kv.trained_context||1048576).toLocaleString()}`:"–";
+  }
+  const sv=TEL.savings||{};
+  $("savings").textContent=sv.usd!=null?`$${sv.usd.toFixed(2)} (priced)`:"–";
+  /* sparks: VRAM hit %, tok/s, KV seq */
+  if(now.vram_hit!=null){sp1.push(now.vram_hit*100); if(sp1.length>240)sp1.shift();}
+  if(now.tok_s!=null){sp2.push(now.tok_s); if(sp2.length>240)sp2.shift();}
+  if(kv.series && kv.series.length) sp3=kv.series;
+  drawSpark($("sp1"),sp1,100,"#39e0ff"); drawSpark($("sp2"),sp2,Math.max(60,...sp2,20),"#3fe07f");
+  drawSpark($("sp3"),sp3,kv.capacity_tokens||262144,"#3fe07f");
+  /* event log: last 9 entries, newest first */
+  const box=$("events"); box.innerHTML="";
+  for(const e of (TEL.events||[]).slice(-9)){
+    const d=document.createElement("div");
+    d.textContent=`${e.t||""} ${e.type||""} ${Object.entries(e).filter(([k])=>!["t","type"].includes(k)).map(([k,v])=>k+"="+(typeof v==="number"?v.toLocaleString():v)).join(" ")}`;
+    box.prepend(d);
+  }
+}
+function drawSpark(c,arr,max,col){
+  const dpr=devicePixelRatio||1; c.width=c.clientWidth*dpr; c.height=c.clientHeight*dpr;
+  const x=c.getContext("2d"); x.clearRect(0,0,c.width,c.height);
+  x.strokeStyle=col; x.lineWidth=1.4*dpr; x.beginPath();
+  arr.forEach((v,i)=>{const px=i/(arr.length-1||1)*c.width, py=c.height-Math.min(1,v/max)*(c.height-4)-2;
+    i?x.lineTo(px,py):x.moveTo(px,py);});
+  x.stroke();
+}
+
+/* ========================== picking / tooltip ============================ */
+const tip=$("tip");
+cv.addEventListener("mousemove",ev=>{
+  if(!gl)return;
+  gl.pick=gl.pickAt(ev.clientX,ev.clientY);
+  const p=gl.pick;
+  if(!p){tip.style.display="none";return;}
+  let html="";
+  if(p.type==="expert"){
+    const L=META.layers[p.layer], dims=META.dims, eb=L.expert_blob, E=dims.experts;
+    const heat=HEAT[p.layer][p.expert];
+    const rank=heat>0?Math.round((1-heat/65535)*(META.profile.hot_pairs-1)):null;
+    html=`<span class="name">layer ${p.layer} · expert ${p.expert}</span><br>
+      block kind: ${L.kind}${L.kind==="draft"?" (NextN draft)":""}<br>
+      profile rank: ${rank!=null?rank+" of "+META.profile.hot_pairs+" hot (layer,expert) pairs — lower = hotter":"cold (anti-co-routing row)"}<br>
+      resident in VRAM cache: ${heat>0?"warmed pair member":"tail (paged on demand)"}<br>
+      gate: ${eb?(eb.gate_per_expert/1024).toFixed(0)+" KiB/expert":"–"} · up: ${eb?(eb.up_per_expert/1024).toFixed(0)+" KiB/expert":"–"} · down: ${eb?(eb.down_per_expert/1024).toFixed(0)+" KiB/expert":"–"}<br>
+      ~bpw: gate ${(eb?eb.gate_per_expert*8/(dims.expert_ffn*dims.hidden):0).toFixed(2)} · up ${(eb?eb.up_per_expert*8/(dims.expert_ffn*dims.hidden):0).toFixed(2)} · down ${(eb?eb.down_per_expert*8/(dims.expert_ffn*dims.hidden):0).toFixed(2)}<br>
+      shard: ${eb?eb.shard||META.native_experts.shard_note||"(abs. offsets, shard 1)":"–"}<br>
+      byte windows (shard-absolute): gate 0x${eb?eb.gate_off.toString(16):"–"} · up 0x${eb?eb.up_off.toString(16):"–"} · down 0x${eb?(eb.down_off+p.expert*eb.down_per_expert).toString(16):"–"}`;
+  }else if(p.type==="plate"){
+    const L=META.layers[p.layer], dims=META.dims, ts=denseTensors(p.layer);
+    let lit=0; const off=p.layer*dims.experts;
+    for(let e=0;e<dims.experts;e++) if(gl.flash[off+e]>0.25) lit++;
+    let nz=0; for(let e=0;e<dims.experts;e++) if(HEAT[p.layer][e]>0) nz++;
+    html=`<span class="name">block ${p.layer}</span> — ${L.kind}${L.kind==="draft"?" (NextN)":""}, ${L.tensors} dense tensors, ${(L.pool_bytes/2**20).toFixed(1)} MiB pool<br>
+      experts: ${dims.experts} routed + ${dims.shared_experts} shared · top-${dims.top_k_experts} → <b>${lit}</b> cells lit right now<br>
+      per generated token this block routes exactly ${dims.top_k_experts} of ${dims.experts} experts (${dims.expert_gating_func===2?"sigmoid gating":"softmax"}, scale ${dims.expert_weights_scale})<br>
+      ${dims.hyper_connections?dims.hyper_connections.count+"-stream hyper-connection":"hyper-connections: n/a"}<br>
+      profile: rank min ${L.profile.rank_min} · median ${L.profile.rank_median} · max ${L.profile.rank_max} · warmed ${nz}/${dims.experts}<br>
+      tensors: ${ts.slice(0,6).map(t=>t.name.replace("blk."+p.layer+".","")).join(", ")}${ts.length>6?" …":""}`;
+  }else if(p.type==="embedding"){
+    const d=META.dims, t=META.dense_tensors.find(t=>t.name==="token_embd.weight");
+    html=`<span class="name">token_embd.weight</span><br>
+      vocab ${d.vocab.toLocaleString()} × hidden ${d.hidden} — quant ${t.quant||t.dtype} ${t.bpw?("("+t.bpw+" bpw)"):""}<br>
+      row = token id; lookup position animates on emitted tokens`;
+  }else if(p.type==="head"){
+    const t=META.dense_tensors.find(t=>t.name==="output.weight");
+    html=`<span class="name">output.weight</span> (${t.quant||t.dtype}, ${t.bpw} bpw)<br>hidden ${META.dims.hidden} → vocab ${META.dims.vocab.toLocaleString()}<br>${t.shard?"shard: "+t.shard:""}`;
+  }else if(p.type==="kv"){
+    const kv=TEL.kv||{}, eng=TEL.engine||{};
+    html=`<span class="name">KV cache growth bar</span> (front-left, 1 cell = ${kv.capacity_tokens?Math.round(kv.capacity_tokens/32).toLocaleString():"cap/32"} tokens)<br>
+      occupancy: ${kv.seq_tokens!=null?kv.seq_tokens.toLocaleString():"–"} / ${kv.capacity_tokens?kv.capacity_tokens.toLocaleString():"–"} tokens (${kv.dtype||"?"} KV)<br>
+      <i style="color:#1acc59">green</i> = VRAM-resident prefix (${kv.resident_tokens?kv.resident_tokens.toLocaleString():"0"} tok) · <i style="color:#4073d9">blue</i> = KV streamed from RAM<br>
+      newest written cell flashes · trained context ${(kv.trained_context||1048576).toLocaleString()} tok`;
+  }else if(p.type==="mtp"){
+    const nn=META.nextn||{}, dr=META.drafter||{}, dm=(dr.meta||{});
+    html=`<span class="name">NextN draft (blk.45) + DFlash2 drafter</span><br>
+      NextN: ${nn.tensors?nn.tensors.length:0} tensors (${nn.shard||"shards 2+3"}) — eh_proj, enorm/hnorm, shared_head_norm, ffn_up_exps/shexp, indexer<br>
+      DFlash2: ${dm["general.size_label"]||"1.2B"} drafter, ${dr.file_size?(dr.file_size/2**20).toFixed(0)+" MiB":"–"} Q4_K_M<br>
+      ${dm["dflash.block_count"]?"blocks "+dm["dflash.block_count"]+" · trunk layers "+(dm["dflash.trunk_layers"]||"?")+" · window "+dm["dflash.window"]:""}<br>
+      engine: ${dr.note||"block-diffusion drafts, MTP off"}`;
+  }
+  tip.innerHTML=html; tip.style.display="block";
+  tip.style.left=Math.min(ev.clientX+14,innerWidth-400)+"px";
+  tip.style.top=Math.min(ev.clientY+14,innerHeight-220)+"px";
+});
+cv.addEventListener("mouseleave",()=>tip.style.display="none");
+function denseTensors(L){return META.dense_tensors.filter(t=>t.name.startsWith("blk."+L+"."));}
+cv.addEventListener("click",ev=>{ /* fly to plate */
+  if(!gl)return;
+  const p=gl.pickAt(ev.clientX,ev.clientY);
+  if(p&&p.type!=="mtp"){const c=plateCenter(p.layer,LTOT); gl.target=[c[0],0,c[2]];}
+});
+
+/* ============================ camera input =============================== */
+let drag=null;
+cv.addEventListener("pointerdown",e=>drag={b:e.button,x:e.clientX,y:e.clientY});
+addEventListener("pointerup",()=>drag=null);
+addEventListener("pointermove",e=>{
+  if(!drag)return;
+  const dx=e.clientX-drag.x, dy=e.clientY-drag.y; drag.x=e.clientX; drag.y=e.clientY;
+  if(drag.b===2){/* pan in view plane */
+    if(!gl)return;
+  gl.target[0]-=dx*gl.orbDist*0.0016*Math.cos(gl.orbAz); gl.target[2]+=dx*gl.orbDist*0.0016*Math.sin(gl.orbAz);
+  }else{gl.orbAz-=dx*0.005; gl.orbEl=Math.min(1.45,Math.max(0.08,gl.orbEl+dy*0.005));}
+});
+cv.addEventListener("wheel",e=>{e.preventDefault();gl.orbDist=Math.min(1400,Math.max(40,gl.orbDist*(1+e.deltaY*0.001)));},{passive:false});
+cv.addEventListener("contextmenu",e=>e.preventDefault());
+addEventListener("keydown",e=>{if(e.key==="r"){gl.orbAz=0;gl.orbEl=0.9;gl.orbDist=520;gl.target=[0,0,0];}});
+
+/* ============================ render loop =============================== */
+let last=performance.now();
+(function loop(now){const dt=Math.min(0.05,(now-last)/1000);last=now;gl.frame(dt);requestAnimationFrame(loop);})(last);
+</script>
+</body>
+</html>
