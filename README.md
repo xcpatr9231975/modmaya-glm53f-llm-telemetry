@@ -125,7 +125,7 @@ Summary over the 40 s window:
 
 To reproduce:
 
-    python3 /tmp/load_test.py     # or any 4-worker load; sample /api/telemetry
+    python3 tools/load_test.py    # 4 workers, 40 s, samples /api/telemetry every 2 s
 
 ## Honesty note (synthetic overlay)
 
