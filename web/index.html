@@ -244,13 +244,33 @@ function renderHud(){
     box.prepend(d);
   }
 }
+function fmtN(v){ /* compact axis/current-value labels */
+  if(v==null)return "–";
+  const a=Math.abs(v);
+  if(a>=1e6) return (v/1e6).toFixed(a>=1e7?0:2)+"M";
+  if(a>=1e4) return (v/1e3).toFixed(0)+"k";
+  if(a>=100) return v.toFixed(0);
+  if(a>=10)  return v.toFixed(1);
+  return v.toFixed(2);
+}
 function drawSpark(c,arr,max,col){
   const dpr=devicePixelRatio||1; c.width=c.clientWidth*dpr; c.height=c.clientHeight*dpr;
   const x=c.getContext("2d"); x.clearRect(0,0,c.width,c.height);
+  if(!arr.length)return;
+  const mn=Math.min(...arr), pad=3*dpr, fs=9*dpr;
   x.strokeStyle=col; x.lineWidth=1.4*dpr; x.beginPath();
   arr.forEach((v,i)=>{const px=i/(arr.length-1||1)*c.width, py=c.height-Math.min(1,v/max)*(c.height-4)-2;
     i?x.lineTo(px,py):x.moveTo(px,py);});
   x.stroke();
+  /* current value: bold, top-left, with a dot on the newest sample */
+  const last=arr[arr.length-1], lx=c.width, ly=c.height-Math.min(1,last/max)*(c.height-4)-2;
+  x.fillStyle=col; x.beginPath(); x.arc(lx-1.5*dpr,ly,2*dpr,0,Math.PI*2); x.fill();
+  x.font=`bold ${fs}px monospace`; x.textBaseline="top"; x.textAlign="left";
+  x.fillText(fmtN(last),pad,pad);
+  /* y-axis legend: range labels top-right / bottom-right (dim) */
+  x.fillStyle="rgba(190,200,215,.6)"; x.font=`${fs}px monospace`; x.textAlign="right";
+  x.fillText(fmtN(max),c.width-pad,pad);
+  if(mn!==max) x.fillText(fmtN(mn),c.width-pad,c.height-pad-fs);
 }
 
 /* ========================== picking / tooltip ============================ */
