@@ -64,6 +64,9 @@ const KIND_COL={mla:[0.10,0.85,0.95], dsa:[0.85,0.25,0.90], draft:[0.25,0.90,0.3
 /* --------------------------- layout constants ---------------------------- */
 /* plates: 46 layers -> 8 columns x 6 rows */
 const COLS=8, PLATE_W=40, PLATE_H=26, GAP_X=52, GAP_Z=40;
+/* expert-cell geometry: pitch scales with the 24x12 grid on the 40-unit plate
+   (qwen was 32x16 with CELL=1.02, CELL_GAP=0.135; 24x12 uses CELL=1.3, CELL_GAP=0.25) */
+const CELL=1.3, CELL_GAP=0.25;
 const ROWS=L=>Math.ceil(L/COLS);
 /* expert grid per plate: nearest divisor pair to a 2:1 aspect (512->32x16, 288->24x12) */
 function gridFor(n){let r=Math.round(Math.sqrt(n/2));while(n%r)r--;return {c:n/r,r};}
@@ -415,9 +418,9 @@ class AtlasGL{
     for(const L of this.layers){
       if(Math.abs(px-L.c[0])<=PLATE_W/2 && Math.abs(pz-L.c[2])<=PLATE_H/2){
         const dims=this.meta.dims, c=L.c;
-        const bx=c[0]-((GRID_C-1)*(CELL+CELL_GAP))/2, bz=c[2]+1.9-((GRID_R-1)*(CELL+CELL_GAP))/2;
+        const bx=c[0]-((this.GRID.c-1)*(CELL+CELL_GAP))/2, bz=c[2]+1.9-((this.GRID.r-1)*(CELL+CELL_GAP))/2;
         const cc=Math.round((px-bx)/(CELL+CELL_GAP)), rr=Math.round((pz-bz)/(CELL+CELL_GAP));
-        if(cc>=0&&cc<GRID_C&&rr>=0&&rr<GRID_R&&Math.abs(px-(bx+cc*(CELL+CELL_GAP)))<CELL &&
+        if(cc>=0&&cc<this.GRID.c&&rr>=0&&rr<this.GRID.r&&Math.abs(px-(bx+cc*(CELL+CELL_GAP)))<CELL &&
            Math.abs(pz-(bz+rr*(CELL+CELL_GAP)))<CELL){
           const e=rr*GRID_C+cc;
           return {type:"expert",layer:L.i,expert:e};
