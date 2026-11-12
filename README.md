@@ -15,6 +15,14 @@ cells routed on the current token (see honesty note below). Front-left, a
 32-cell KV growth bar (1 cell = capacity/32 tokens; green = VRAM-resident
 prefix, blue = KV streamed from RAM).
 
+![atlas live demo — 50 s, 4 simulated sessions under load](assets/atlas_demo.gif)
+
+*(Captured headlessly from `http://127.0.0.1:8091/` during the 50 s benchmark
+below: 25 frames @ 2 s/frame via Chromium CDP — `tools/screen_capture.py`.
+Watch the GPU power sparkline ride the ~12 W idle → ~50 W decode step, the
+board power / J-token / link-util HUD rows, and the amber expert routing
+flashes.)*
+
 ## Layout
 
     tools/build_atlas.py     GGUF / pack index.txt / STRP profile -> web/atlas_data.js
@@ -141,12 +149,23 @@ Summary over the 40 s window:
 
 To reproduce:
 
-    python3 tools/load_test.py    # 4 workers, 40 s, samples /api/telemetry every 2 s
+    python3 tools/load_test.py    # 4 simulated sessions; --duration 50 samples
+                                  # /api/telemetry every 2 s -> /tmp/load_samples.json
 
 ## Power and link utilisation under load (measured)
 
-Second 4-session/40 s run with the power + network channels live (NVML board
-draw, `/proc/net/dev` deltas against the negotiated link rate):
+**50 s capture run** (the GIF above; 6 simulated prompts, 4 workers,
+`python3 tools/load_test.py --duration 50`):
+
+| metric | value |
+|---|---|
+| stream chunks | 664 (0 errors) |
+| decode | 12.3 – 15.2 tok/s |
+| board power | 47.6 – **51.8 W** steady (~50 W mean, vs 11.8 W idle) |
+| energy | **3.7 J/token** mean (≈ 980 tok/Wh) |
+| link util | 0.18 – 0.52 % of Wi-Fi PHY (benchmark rides loopback) |
+
+First 40 s/4-prompt run (for the record):
 
 | t (s) | tok/s | board W | J/token | GPU % | °C | link util % |
 |---|---|---|---|---|---|---|
@@ -176,6 +195,16 @@ draw, `/proc/net/dev` deltas against the negotiated link rate):
   (`wlP9s9 138M 0.1% · enP7s7 1000M 0.0% · tailscale0 … · lo local …`).
 
 Re-run with the same command — `tools/load_test.py` now samples `power` and
+`network` too and writes them to `/tmp/load_samples.json`. To re-capture the
+README GIF: start `python3 tools/screen_capture.py --duration 50` a beat
+after the load test, then
+
+    ffmpeg -framerate 1/2 -i shots/frame_%04d.png -filter_complex \
+      "[0:v]scale=1280:-1[s];[s]split[a][b];[a]palettegen[pal];[b][pal]paletteuse" \
+      -loop 0 assets/atlas_demo.gif
+
+(≈ 0.9 MB for 25 frames — kept under 1 MB so it stays snappy on GitHub.)
+
 `network` too and writes them to `/tmp/load_samples.json`.
 
 ## Honesty note (synthetic overlay)

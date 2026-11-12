@@ -1,19 +1,27 @@
-"""4 simulated sessions hammering glm-5.3-flash; sample atlas telemetry every 2s for 40s.
-Usage: python3 tools/load_test.py [--port 8009] [--atlas-host 127.0.0.1:8091]
+"""4 simulated sessions hammering glm-5.3-flash; sample atlas telemetry every 2s.
+Usage: python3 tools/load_test.py [--duration 50] [--port 8009] [--atlas-host 127.0.0.1:8091]
 Writes /tmp/load_samples.json and prints a summary; see README load-test section."""
-import json, threading, time, urllib.request, urllib.error
+import argparse, json, threading, time, urllib.request, urllib.error
 
-PORT, KEY = 8009, "sk-local"
+ap = argparse.ArgumentParser()
+ap.add_argument("--duration", type=float, default=50)
+ap.add_argument("--port", type=int, default=8009)
+ap.add_argument("--atlas-host", default="127.0.0.1:8091")
+args = ap.parse_args()
+
+PORT, KEY = args.port, "sk-local"
 URL = f"http://127.0.0.1:{PORT}/v1/chat/completions"
-TEL = "http://127.0.0.1:8091/api/telemetry"
+TEL = f"http://{args.atlas_host}/api/telemetry"
 
 PROMPTS = [
     "Explain in detail how a transformer's grouped-query attention differs from multi-head attention, with concrete tensor shapes.",
     "Write a careful summary of how speculative decoding works when the drafter is a block-diffusion model.",
     "Describe the tradeoffs between IQ2_XXS and Q4_K_M quantization for MoE expert tensors, layer by layer.",
     "Walk through how an expert-cache hit-rate affects decode speed on a unified-memory GPU, with examples.",
+    "Draft a short design note: what would a per-expert activation histogram tell us about routing collapse, and how should the HUD visualise it?",
+    "Compare serving the same MoE from a page-able expert cache versus a pinned pool: latency profile, memory pressure, failure modes.",
 ]
-stop = time.time() + 40
+stop = time.time() + args.duration
 errors = counts = 0
 
 def worker(i):
