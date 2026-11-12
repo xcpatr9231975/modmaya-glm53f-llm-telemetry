@@ -22,7 +22,9 @@ prefix, blue = KV streamed from RAM).
                              live/atlas_manifest.json
     collect/collector.py     polls http://127.0.0.1:8009/metrics (token `sk-local`,
                              override with MAYA_METRICS_TOKEN), tails the maya log,
-                             atomically writes live/telemetry.json, serves web/
+                             samples /proc/net/dev + link speeds for interface
+                             utilisation, atomically writes live/telemetry.json,
+                             serves web/
                              statically (/api/telemetry, /api/atlas); --bind
                              tailscale re-binds the HTTP side to the tailscale0
                              address (metrics poll always stays on 127.0.0.1)
@@ -34,7 +36,8 @@ prefix, blue = KV streamed from RAM).
                              particles, KV growth bar, DFlash2 draft loop)
     web/index.html           DOM HUD: phase, tok/s, prompt/out, DFlash2 accept,
                              expert residency (VRAM + RAM tiers), tier traffic,
-                             hardware, KV, spend saved, event log, sparklines
+                             hardware, board power + J/token, network link
+                             utilisation, KV, spend saved, event log, sparklines
                              (y-axis legends + live current value)
     test/test_all.py         unittest suite: GGUF decode, STRP profile semantics,
                              native_experts arithmetic, log dialect, compose()
@@ -74,6 +77,19 @@ open `http://<tailscale-ip>:8091/` from any tailnet device; the HUD fetches
   prompt/output totals, DFlash2 accept/offered, expert residency
   (VRAM slots + RAM tier), tier traffic (RAM fetch, disk read, promotions),
   GPU util/temp/CPU, VRAM pool, storage, USD saved vs cloud, event log.
+- **Power** (NVML board draw, `hardware.gpu_power` + the engine's 120-sample
+  history): live watts, window mean/peak, and the derived decode energy cost
+  **J/token** (`W / (tok/s)`) and **tok/Wh**. GB10 is an APU, so the rail
+  covers the whole SoC, and NVML reports no enforced cap on this part — when
+  a cap *is* reported the HUD also shows `% of limit`. Sparkline: `GPU power W`.
+- **Network link utilisation** (`/proc/net/dev` deltas ÷ negotiated link rate):
+  per-interface rx/tx Mbit/s and **% of link speed**. Wired speeds come from
+  `/sys/class/net/<if>/speed`, Wi-Fi from the current `iw dev <if> link` PHY
+  bitrate (re-read every 15 s — it renegotiates constantly). Links are full
+  duplex, so `util_pct = max(rx%, tx%)`. The primary link is the busiest
+  default-route interface; `tailscale0` (tunnel, no link rate) and `lo` (which
+  carries the engine API traffic when you drive it locally) are reported as
+  throughput only. Sparklines: `link util %` and `net Mbit/s (rx+tx)`.
 
 ## Live load test — 4 concurrent sessions, 40 seconds
 
@@ -126,6 +142,41 @@ Summary over the 40 s window:
 To reproduce:
 
     python3 tools/load_test.py    # 4 workers, 40 s, samples /api/telemetry every 2 s
+
+## Power and link utilisation under load (measured)
+
+Second 4-session/40 s run with the power + network channels live (NVML board
+draw, `/proc/net/dev` deltas against the negotiated link rate):
+
+| t (s) | tok/s | board W | J/token | GPU % | °C | link util % |
+|---|---|---|---|---|---|---|
+|  0 | idle | 11.95 | – | 0 | 56 | 0.11 |
+|  2 | 16.3 | 12.18 | 0.75 | 0 | 55 | 0.10 |
+|  4 | 15.6 | 45.72 | 2.93 | 95 | 62 | 0.09 |
+|  6 | 15.5 | 45.98 | 2.97 | 95 | 64 | 0.09 |
+|  8 | 15.2 | 47.13 | 3.10 | 94 | 65 | 0.09 |
+| 10 | 15.7 | 46.85 | 2.98 | 95 | 66 | 0.09 |
+| 34 | 14.4 | 47.29 | 3.28 | 95 | 71 | 0.12 |
+| 36 | 14.7 | 47.91 | 3.26 | 95 | 72 | 0.12 |
+| 38 | 14.5 | 48.14 | 3.32 | 95 | 72 | 0.12 |
+
+- **Board power: 11.95 W idle → 49.04 W peak** (mean 43.8 W over the window).
+  The step from ~12 W to ~46 W happens in one 2 s sample, the moment the four
+  sessions start decoding; the slow creep from 45.7 → 48.1 W over the window
+  tracks the 62 → 72 °C warm-up.
+- **Energy per token: 0.75 – 3.35 J/token** (mean 2.92 J/token at ~15 tok/s,
+  i.e. ≈ 1,230 tok/Wh). The 0.75 J/token sample is the first tick, where the
+  tok/s counter is already live but the power sample still reflects idle.
+- **Link utilisation: 0.09 – 0.12 %** of a 103 – 138 Mbit/s Wi-Fi PHY rate.
+  That is expected and is the point of the panel: the load generator talks to
+  the engine over **loopback**, so the physical link only carries the HUD's
+  `/api/telemetry` polling. Driving the engine from another tailnet device
+  moves the traffic onto `tailscale0` + the wired/Wi-Fi link, and the
+  utilisation sparkline follows it. The HUD lists every carrier-up interface
+  (`wlP9s9 138M 0.1% · enP7s7 1000M 0.0% · tailscale0 … · lo local …`).
+
+Re-run with the same command — `tools/load_test.py` now samples `power` and
+`network` too and writes them to `/tmp/load_samples.json`.
 
 ## Honesty note (synthetic overlay)
 

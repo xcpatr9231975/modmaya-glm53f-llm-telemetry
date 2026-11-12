@@ -9,12 +9,14 @@
     top-left  : engine phase, tok/s, prompt/output totals, DFlash2 accept,
                 expert residency (VRAM + RAM tiers of the 12,096 experts)
     top-right : GPU (NVIDIA GB10 iGPU, NVML), unified memory, CPU/RAM,
-                storage, KV cache occupancy (int8 tokens, VRAM-resident)
+                board power + J/token, network link utilisation (% of the
+                negotiated link rate), storage, KV cache occupancy
     bottom-left : rolling engine event log (log_parser.py event types)
     bottom-mid  : forward-pass stage strip (EMB -> HC -> MLA/DSA -> HC ->
                 ROUTER -> 8/288 experts -> SHARED -> HEAD), driven by the
                 live token particle position in the WebGL scene
-    bottom-right : sparklines (VRAM hit %, tok/s, KV seq tokens)
+    bottom-right : sparklines, 2 columns (VRAM hit %, GPU power W, tok/s,
+                link util %, KV seq tokens, net Mbit/s)
     hover     : expert cell -> layer, expert id, shard byte ranges from
                 native_experts.txt (gate/up/down regions, bytes/expert, bpw);
                 plate -> lit expert cells now; KV bar -> occupancy breakdown
@@ -44,6 +46,9 @@
   .big{font-size:20px;color:#fff}
   .ok{color:var(--ok)} .warn{color:var(--warn)} .dim{color:var(--dim)}
   canvas.spark{width:100%;height:46px;display:block}
+  .sparkgrid{display:grid;grid-template-columns:1fr 1fr;gap:2px 12px}
+  .sparkgrid>div{min-width:0}
+  .sparkgrid .lbl{font-size:10.5px;color:var(--dim)}
   #events{height:118px;overflow:hidden;font-size:11px;color:var(--dim);
     display:flex;flex-direction:column-reverse}
   #tip{position:absolute;display:none;max-width:380px;z-index:5}
@@ -83,6 +88,9 @@
     <b>GPU</b><span id="gpu">–</span>
     <b>VRAM</b><span id="vram">–</span>
     <b>temp / power</b><span id="tp">–</span>
+    <b>energy</b><span id="energy">–</span>
+    <b>network</b><span id="net">–</span>
+    <b>links</b><span id="netlinks" class="dim">–</span>
     <b>CPU / RAM</b><span id="cram">–</span>
     <b>storage</b><span id="storage">–</span>
     <b>KV cache</b><span id="kvc">–</span>
@@ -113,9 +121,14 @@
   </div>
   <div class="hud sparks">
     <h1>sparklines</h1>
-    VRAM hit %<canvas id="sp1" class="spark"></canvas>
-    decode tok/s<canvas id="sp2" class="spark"></canvas>
-    KV seq tokens<canvas id="sp3" class="spark"></canvas>
+    <div class="sparkgrid">
+      <div><span class="lbl">VRAM hit %</span><canvas id="sp1" class="spark"></canvas></div>
+      <div><span class="lbl">GPU power W</span><canvas id="sp4" class="spark"></canvas></div>
+      <div><span class="lbl">decode tok/s</span><canvas id="sp2" class="spark"></canvas></div>
+      <div><span class="lbl">link util % <span id="splink" class="dim"></span></span><canvas id="sp5" class="spark"></canvas></div>
+      <div><span class="lbl">KV seq tokens</span><canvas id="sp3" class="spark"></canvas></div>
+      <div><span class="lbl">net Mbit/s (rx+tx)</span><canvas id="sp6" class="spark"></canvas></div>
+    </div>
   </div>
 </div>
 
@@ -141,7 +154,7 @@ const LTOT=META.dims.layers;
 
 /* ======================= telemetry polling =============================== */
 /* collector.py writes live/telemetry.json; served mode maps /api/telemetry. */
-let TEL={events:[]}, sp1=[], sp2=[], sp3=[], pollState="connecting…";
+let TEL={events:[]}, sp1=[], sp2=[], sp3=[], sp4=[], sp5=[], sp6=[], pollState="connecting…";
 async function poll(){
   for(const u of ["api/telemetry","../live/telemetry.json","telemetry.json"]){
     let tel=null;
@@ -190,7 +203,7 @@ const pct=x=>(100*x).toFixed(1)+"%";
 function renderHud(){
   const live=TEL.live||{}, hw=TEL.hardware||{}, hws=TEL.hardware_static||{},
         tot=TEL.totals||{}, eng=TEL.engine||{}, now=((TEL.tiers||{}).now)||{},
-        drv=TEL.derived||{}, gpu=TEL.gpu||{};
+        drv=TEL.derived||{}, gpu=TEL.gpu||{}, pw=TEL.power||{}, net=TEL.network||{};
   $("mver").textContent=eng.maya_version?("maya "+eng.maya_version):"";
   $("phase").textContent=live.phase||live.state||"idle";
   $("toks").textContent=(live.tok_s||now.tok_s||0).toFixed(1);
@@ -214,7 +227,27 @@ function renderHud(){
     $("vram").innerHTML=`<span class="${gpu.free_gb/gpu.total_gb<0.06?"warn":"ok"}">${used.toFixed(1)} / ${gpu.total_gb.toFixed(1)} GB</span>`
       +(gpu.pool_gb?` · expert pool ${gpu.pool_gb.toFixed(1)} GB · drafter ${gpu.drafter_gb??"–"} GB`:"");
   }else $("vram").textContent="–";
-  $("tp").textContent=hw.gpu_temp!=null?`${hw.gpu_temp.toFixed(0)} °C · ${(hw.gpu_power||0).toFixed(1)} W${hw.gpu_power_limit?` / ${hw.gpu_power_limit.toFixed(0)} W`:" (APU)"}`:"–";
+  /* power: NVML board draw. GB10 is an APU, so this rail covers the SoC. */
+  const watts=pw.gpu_w!=null?pw.gpu_w:hw.gpu_power;
+  $("tp").innerHTML=hw.gpu_temp!=null
+    ?`${hw.gpu_temp.toFixed(0)} °C · <span class="${pw.util_pct>90?"warn":"ok"}">${(watts||0).toFixed(1)} W</span>`
+     +`${pw.limit_w?` / ${pw.limit_w.toFixed(0)} W (${pw.util_pct.toFixed(0)}%)`:" (APU rail, no cap reported)"}`
+    :"–";
+  $("energy").textContent=(pw.mean_w!=null)
+    ?`mean ${pw.mean_w.toFixed(1)} W · peak ${pw.peak_w.toFixed(1)} W`
+     +(pw.j_per_token!=null?` · ${pw.j_per_token.toFixed(2)} J/tok (${pw.tok_per_wh.toFixed(0)} tok/Wh)`:" · idle")
+    :"–";
+  /* network: % of negotiated link rate (full duplex -> max(rx%,tx%)) */
+  if(net.primary){
+    const u=net.util_pct, cls=u==null?"dim":(u>80?"warn":"ok");
+    $("net").innerHTML=`<span class="${cls}">${u!=null?u.toFixed(1)+" %":"–"}</span> of `
+      +`${net.link_mbit?net.link_mbit.toFixed(0)+" Mbit/s":"? link"} on ${net.primary} · `
+      +`↓${(net.rx_mbps||0).toFixed(2)} / ↑${(net.tx_mbps||0).toFixed(2)} Mbit/s`;
+    $("netlinks").innerHTML=(net.ifaces||[]).map(i=>
+      `${i.name} ${i.link_mbit?i.link_mbit.toFixed(0)+"M":(i.kind==="loopback"?"local":"?")} `
+      +`${i.util_pct!=null?i.util_pct.toFixed(1)+"%":((i.rx_mbps!=null)?((i.rx_mbps+i.tx_mbps).toFixed(1)+"Mb"):"–")}`).join(" · ");
+    $("splink").textContent=net.link_mbit?`(${net.primary} @ ${net.link_mbit.toFixed(0)} Mbit/s)`:`(${net.primary})`;
+  }
   $("cram").textContent=hw.cpu!=null?`${hw.cpu.toFixed(0)} % CPU · ${(hw.ram_used/(1<<30)).toFixed(1)} / ${(hw.ram_total/(1<<30)).toFixed(1)} GB (${hws.cpu_name||""}, ${hws.threads||"?"} threads)`:"–";
   const st=TEL.storage||{};
   $("storage").textContent=st.free!=null?`${(st.free/(1<<40)).toFixed(2)} TB free of ${(st.total/(1<<40)).toFixed(2)} TB`:"–";
@@ -230,12 +263,21 @@ function renderHud(){
   }
   const sv=TEL.savings||{};
   $("savings").textContent=sv.usd!=null?`$${sv.usd.toFixed(2)} (priced)`:"–";
-  /* sparks: VRAM hit %, tok/s, KV seq */
+  /* sparks: VRAM hit %, GPU power W, tok/s, link util %, KV seq, net Mbit/s */
   if(now.vram_hit!=null){sp1.push(now.vram_hit*100); if(sp1.length>240)sp1.shift();}
   if(now.tok_s!=null){sp2.push(now.tok_s); if(sp2.length>240)sp2.shift();}
   if(kv.series && kv.series.length) sp3=kv.series;
+  if(pw.series && pw.series.length) sp4=pw.series;          /* engine-side 120 samples */
+  else if(watts!=null){sp4.push(watts); if(sp4.length>240)sp4.shift();}
+  const nh=net.history||{};
+  if(nh.util && nh.util.length) sp5=nh.util;
+  if(nh.rx_mbps && nh.rx_mbps.length)
+    sp6=nh.rx_mbps.map((v,i)=>v+((nh.tx_mbps||[])[i]||0));
   drawSpark($("sp1"),sp1,100,"#39e0ff"); drawSpark($("sp2"),sp2,Math.max(60,...sp2,20),"#3fe07f");
   drawSpark($("sp3"),sp3,kv.capacity_tokens||262144,"#3fe07f");
+  drawSpark($("sp4"),sp4,pw.limit_w||Math.max(10,...sp4)*1.15,"#ffb02e");
+  drawSpark($("sp5"),sp5,Math.max(1,...sp5)<10?10:100,"#d940e6");
+  drawSpark($("sp6"),sp6,Math.max(1,...sp6)*1.15,"#d940e6");
   /* event log: last 9 entries, newest first */
   const box=$("events"); box.innerHTML="";
   for(const e of (TEL.events||[]).slice(-9)){

@@ -126,6 +126,57 @@ cell, 3 bar, 4 particle, 5 slab, 6 grid line).
   from the lead particle's position along the polyline (49 segments:
   embed, 46 plates, head).
 
+## 7b. Power and link-utilisation sampling
+
+Two channels were added to the collector; both are measured, neither is
+modelled.
+
+**Power.** maya's `/metrics` already carries NVML board draw
+(`hardware.gpu_power`) plus a 120-sample `history.gpu_power` ring, so the
+collector only has to shape it: `power.{gpu_w, mean_w, peak_w, limit_w,
+util_pct, series}` plus two derived figures that are the interesting ones for
+an inference box — **`j_per_token = W / (tok/s)`** and
+**`tok_per_wh = tok/s * 3600 / W`**. `None` entries are filtered out of the
+series before min/max/mean so a single NVML hiccup can't poison the axis.
+GB10 is an APU: the rail is the whole SoC, and NVML reports *no enforced
+power cap* on this part, so `limit_w`/`util_pct` stay null and the HUD says
+“APU rail, no cap reported” rather than inventing a TDP. Measured: 11.95 W
+idle → 49.04 W peak, ≈ 2.9 J/token at ~15 tok/s.
+
+**Network.** `/proc/net/dev` gives cumulative rx/tx byte counters; the
+sampler differentiates them against the previous poll
+(`rate_mbit = Δbytes * 8 / Δt / 1e6`) and divides by the negotiated link
+rate. Details that matter:
+
+- Link rate: `/sys/class/net/<if>/speed` for wired NICs; Wi-Fi reports `-1`
+  there, so we parse `iw dev <if> link` for the current PHY bitrate. That
+  rate renegotiates constantly (103 → 138 Mbit/s across two runs here), so
+  it is re-read every 15 s and cached in between — utilisation is always a
+  percentage of the rate *at that moment*.
+- Ethernet/Wi-Fi links are **full duplex**, so rx% and tx% are each taken
+  against the whole link rate and `util_pct = max(rx%, tx%)`; summing them
+  would understate headroom.
+- Negative deltas (counter wrap / iface reset) are dropped rather than
+  reported as a huge spike.
+- Interface census: bridges/docker/veth are skipped; `lo` is kept (it carries
+  the engine API traffic when the client is local) but is flagged
+  `kind="loopback"`, excluded from the primary-link election and from the
+  rx/tx totals, and reported as throughput only — a “% of link speed” for
+  loopback would be meaningless. `tailscale0` is `kind="tunnel"`: real
+  throughput, no link rate.
+- Primary link = busiest interface carrying a default route (this box has two:
+  `enP7s7` wired and `wlP9s9` Wi-Fi).
+
+The sampler primes its counters in `__init__`, and `--once` sleeps 0.5 s
+before composing so a one-shot snapshot still has a real delta instead of
+nulls.
+
+**Testing.** `_sysfs()` and `_default_ifaces()` are module-level functions
+precisely so the tests can swap them out; `NetSampler` is built with
+`__new__` and fed synthetic counters, so the arithmetic is asserted exactly
+(12.5 MB in 1 s = 100 Mbit/s = 10.0 % of a 1 Gbit/s link) with no real NIC
+involved. 17 tests now.
+
 ## 8. Deployment
 
 `deploy/maya-glm-atlas.service` (systemd **user** unit) runs the collector
@@ -148,6 +199,14 @@ methods, and truthy for `getShaderParameter`/`getProgramParameter`. Then:
   softmax (layer 19)`.
 - Same technique validated the HUD (`renderHud` with a stub DOM), the
   sparkline legends, and the poll-chain resilience.
+- Reused again for the power/network HUD rows: the last `<script>` block is
+  extracted from `index.html`, `renderHud` is run against a real
+  `/api/telemetry` payload with a stub DOM + 2-D context, and the resulting
+  `textContent` of each new node is printed — e.g.
+  `56 °C · 12.0 W (APU rail, no cap reported)`,
+  `mean 12.4 W · peak 13.2 W · 0.82 J/tok (4382 tok/Wh)`,
+  `0.1 % of 138 Mbit/s on wlP9s9 · ↓0.02 / ↑0.12 Mbit/s`. Caught the
+  duplicated `lo (lo)` label before it ever hit a browser.
 
 Rule of thumb: **if the renderer is the only untestable piece, stub the GL
 context — the JS is testable end-to-end without a browser.**

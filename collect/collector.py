@@ -50,6 +50,179 @@ def fetch_json(url: str, timeout: float = 3.0):
         return json.loads(r.read().decode("utf-8", "replace"))
 
 
+SKIP_IFACE = re.compile(r"^(docker\d+|br-|veth|virbr|vmnet|dummy|bond_|ifb)")
+
+
+def _default_ifaces():
+    """Interfaces carrying a default route (/proc/net/route), most-preferred first."""
+    out = []
+    try:
+        with open("/proc/net/route") as f:
+            next(f)
+            rows = []
+            for line in f:
+                p = line.split()
+                if len(p) > 7 and p[1] == "00000000":
+                    rows.append((int(p[6]), p[0]))   # (metric, iface)
+        for _, name in sorted(rows):
+            if name not in out:
+                out.append(name)
+    except Exception:
+        pass
+    return out
+
+
+def _sysfs(name: str, attr: str):
+    """Read /sys/class/net/<name>/<attr>, or None."""
+    try:
+        with open(f"/sys/class/net/{name}/{attr}") as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def _link_mbit(name: str):
+    """Negotiated link speed in Mbit/s, or None when the kernel won't say.
+
+    Wired NICs expose /sys/class/net/<if>/speed. Wi-Fi reports -1/empty there,
+    so we ask `iw dev <if> link` for the current TX/RX PHY bitrate (that *is*
+    the link capacity at this instant — it renegotiates constantly).
+    """
+    try:
+        v = int(_sysfs(name, "speed") or "")
+        if v > 0:
+            return float(v), "sysfs"
+    except Exception:
+        pass
+    try:
+        import subprocess
+        txt = subprocess.run(["iw", "dev", name, "link"], capture_output=True,
+                             text=True, timeout=2).stdout
+        rates = [float(m) for m in re.findall(r"bitrate:\s*([\d.]+)\s*MBit/s", txt)]
+        if rates:
+            return max(rates), "iw"
+    except Exception:
+        pass
+    return None, None
+
+
+class NetSampler:
+    """Per-interface throughput + link utilisation from /proc/net/dev.
+
+    Byte counters are differentiated against the previous sample, converted to
+    Mbit/s, and divided by the negotiated link speed to get utilisation %.
+    Ethernet/Wi-Fi links are full duplex, so rx% and tx% are computed against
+    the full link rate independently and `util_pct` is max(rx%, tx%).
+    Link speed is re-read every `speed_ttl` seconds (Wi-Fi PHY rate drifts).
+    """
+    def __init__(self, hist_len: int = 120, speed_ttl: float = 15.0):
+        self.prev: dict = {}
+        self.prev_t = None
+        self.speeds: dict = {}
+        self.speed_ttl = speed_ttl
+        self.hist = {"util": deque(maxlen=hist_len),
+                     "rx_mbps": deque(maxlen=hist_len),
+                     "tx_mbps": deque(maxlen=hist_len)}
+        self.sample()   # prime the counters
+
+    @staticmethod
+    def _read_dev():
+        stats = {}
+        try:
+            with open("/proc/net/dev") as f:
+                for line in f.readlines()[2:]:
+                    name, _, rest = line.partition(":")
+                    name = name.strip()
+                    p = rest.split()
+                    if len(p) >= 9:
+                        stats[name] = (int(p[0]), int(p[8]))   # rx bytes, tx bytes
+        except Exception:
+            pass
+        return stats
+
+    def _speed(self, name, now):
+        s = self.speeds.get(name)
+        if s is None or now - s[2] > self.speed_ttl:
+            mbit, src = _link_mbit(name)
+            s = (mbit, src, now)
+            self.speeds[name] = s
+        return s[0], s[1]
+
+    def sample(self):
+        now = time.time()
+        cur = self._read_dev()
+        dt = (now - self.prev_t) if self.prev_t else 0.0
+        defaults = _default_ifaces()
+        ifaces = []
+        for name, (rx, tx) in cur.items():
+            if SKIP_IFACE.match(name):
+                continue
+            try:
+                oper = _sysfs(name, "operstate") or "unknown"
+                carrier = _sysfs(name, "carrier") == "1"
+            except Exception:
+                oper, carrier = "unknown", False
+            if not carrier and oper != "up" and name != "lo":
+                continue                       # cable out / radio down
+            rx_mbps = tx_mbps = None
+            p = self.prev.get(name)
+            if p and dt > 0.05:
+                d_rx, d_tx = rx - p[0], tx - p[1]
+                if d_rx >= 0 and d_tx >= 0:    # counter wrap -> skip this tick
+                    rx_mbps = d_rx * 8 / dt / 1e6
+                    tx_mbps = d_tx * 8 / dt / 1e6
+            mbit, src = self._speed(name, now)
+            rx_pct = (100 * rx_mbps / mbit) if (mbit and rx_mbps is not None) else None
+            tx_pct = (100 * tx_mbps / mbit) if (mbit and tx_mbps is not None) else None
+            util = max(rx_pct, tx_pct) if (rx_pct is not None and tx_pct is not None) else None
+            ifaces.append({
+                "name": name,
+                "kind": ("loopback" if name == "lo" else
+                         "tunnel" if name.startswith(("tailscale", "wg", "tun")) else
+                         "wifi" if src == "iw" else "wired"),
+                "oper": oper,
+                "carrier": carrier,
+                "default_route": name in defaults,
+                "link_mbit": mbit,
+                "link_src": src,            # "sysfs" (ethtool) | "iw" (PHY rate)
+                "rx_mbps": round(rx_mbps, 3) if rx_mbps is not None else None,
+                "tx_mbps": round(tx_mbps, 3) if tx_mbps is not None else None,
+                "rx_pct": round(rx_pct, 2) if rx_pct is not None else None,
+                "tx_pct": round(tx_pct, 2) if tx_pct is not None else None,
+                "util_pct": round(util, 2) if util is not None else None,
+                "rx_bytes": rx, "tx_bytes": tx,
+            })
+        self.prev, self.prev_t = cur, now
+
+        # primary link: the default-route iface with the most traffic right now,
+        # else the busiest carrier-up iface (tailscale0 rides on top of it).
+        # Loopback is reported (engine API traffic rides it) but never primary:
+        # it has no link rate, so a utilisation % would be meaningless.
+        def busy(i):
+            return (i["rx_mbps"] or 0) + (i["tx_mbps"] or 0)
+        real = [i for i in ifaces if i["kind"] != "loopback"]
+        cands = [i for i in real if i["default_route"]] or real
+        primary = max(cands, key=busy) if cands else None
+        ifaces.sort(key=lambda i: (i["kind"] == "loopback", not i["default_route"], -busy(i)))
+        if primary:
+            self.hist["util"].append(primary["util_pct"] if primary["util_pct"] is not None else 0.0)
+            self.hist["rx_mbps"].append(primary["rx_mbps"] or 0.0)
+            self.hist["tx_mbps"].append(primary["tx_mbps"] or 0.0)
+        return {
+            "ifaces": ifaces,
+            "primary": primary["name"] if primary else None,
+            "link_mbit": primary["link_mbit"] if primary else None,
+            "util_pct": primary["util_pct"] if primary else None,
+            "rx_mbps": primary["rx_mbps"] if primary else None,
+            "tx_mbps": primary["tx_mbps"] if primary else None,
+            "total_rx_mbps": round(sum((i["rx_mbps"] or 0) for i in real), 3),
+            "total_tx_mbps": round(sum((i["tx_mbps"] or 0) for i in real), 3),
+            "loopback_mbps": next((round(((i["rx_mbps"] or 0) + (i["tx_mbps"] or 0)) / 2, 3)
+                                   for i in ifaces if i["kind"] == "loopback"), None),
+            "history": {k: [round(x, 3) for x in v] for k, v in self.hist.items()},
+        }
+
+
 class LogTailer:
     """Follows the engine log like `tail -F`, yielding parsed events.
 
@@ -105,11 +278,12 @@ class LogTailer:
         return new
 
 
-def compose(metrics, tailer, started, hist=None):
+def compose(metrics, tailer, started, hist=None, net=None):
     """Merge engine metrics + parsed log state into the telemetry snapshot.
 
     `hist` is a persistent dict of deques kept across polls by the caller;
     currently one series: kv.seq_tokens sampled every poll (KV growth curve).
+    `net` is an optional NetSampler (interface throughput / link utilisation).
     """
     if hist is None:
         hist = {"kv": deque(maxlen=180)}
@@ -124,6 +298,8 @@ def compose(metrics, tailer, started, hist=None):
             "log": {"path": tailer.path},
         },
     }
+    if net is not None:
+        out["network"] = net.sample()
     if metrics:
         for k in ("engine", "live", "requests", "requests_kept", "totals", "tiers",
                   "gpu_map", "storage", "savings", "hardware", "hardware_static",
@@ -205,6 +381,26 @@ def compose(metrics, tailer, started, hist=None):
                 "slots": g0.get("slots"),
                 "measured": g0.get("measured"),           # "nvml"
             }
+
+        # ---- (e) power: NVML board draw (W) + the 120-sample history maya
+        #          already keeps, plus decode energy cost (J per token) ------
+        hw = metrics.get("hardware") or {}
+        mh = metrics.get("history") or {}
+        watts = hw.get("gpu_power")
+        tps = (live.get("tok_s") or now.get("tok_s") or 0) or 0
+        series = [w for w in (mh.get("gpu_power") or []) if isinstance(w, (int, float))]
+        out["power"] = {
+            "gpu_w": watts,
+            "limit_w": hw.get("gpu_power_limit"),
+            "util_pct": (100 * watts / hw["gpu_power_limit"])
+                        if (watts is not None and hw.get("gpu_power_limit")) else None,
+            "peak_w": round(max(series), 3) if series else None,
+            "mean_w": round(sum(series) / len(series), 3) if series else None,
+            "j_per_token": round(watts / tps, 2) if (watts and tps > 0) else None,
+            "tok_per_wh": round(tps * 3600 / watts, 1) if (watts and tps > 0) else None,
+            "series": series,
+            "source": "nvml (gpu board draw; GB10 is an APU — SoC rail incl. CPU)",
+        }
     return out
 
 
@@ -297,6 +493,7 @@ def main(argv=None):
 
     tailer = LogTailer(args.log, from_start=args.from_start or args.once)
     hist = {"kv": deque(maxlen=180)}
+    net = NetSampler()
     started = time.time()
     errors = 0
 
@@ -310,7 +507,8 @@ def main(argv=None):
     if args.once:
         m = fetch_json(args.metrics)
         tailer.pump()
-        snap = compose(m, tailer, started, hist)
+        time.sleep(0.5)                      # let the net counters accumulate a delta
+        snap = compose(m, tailer, started, hist, net)
         snap["sources"]["metrics"]["url"] = args.metrics
         os.makedirs(os.path.dirname(args.out), exist_ok=True)
         with open(args.out, "w") as f:
@@ -329,7 +527,7 @@ def main(argv=None):
             if errors in (1, 10, 100):
                 print(f"[collector] metrics poll failed ({errors}x): {e}", flush=True)
         tailer.pump()
-        snap = compose(m, tailer, started, hist)
+        snap = compose(m, tailer, started, hist, net)
         snap["sources"]["metrics"]["url"] = args.metrics
         tmp = args.out + ".tmp"
         os.makedirs(os.path.dirname(args.out), exist_ok=True)

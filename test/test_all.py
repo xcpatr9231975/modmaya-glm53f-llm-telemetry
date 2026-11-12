@@ -4,11 +4,12 @@ Covers: maya-written GGUF v3 metadata parsing (u32 KV-type writer quirk),
 GLM STRP expert-profile decode (rank-ordered perfect-matching semantics),
 native_experts offset table, dense tensor arithmetic, log_parser event
 taxonomy for the maya/glm dialect (Strata dialect kept as legacy), and
-collector.compose() snapshot shape.
+collector.compose() snapshot shape, GPU power accounting and network
+link-utilisation maths.
 
 Run from repo root: python3 -m unittest discover -s test -v
 """
-import json, os, struct, sys, tempfile, time, unittest
+import collections, json, os, struct, sys, tempfile, time, unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "collect"))
@@ -202,6 +203,88 @@ class TestCollector(unittest.TestCase):
         self.assertEqual(out["kv"]["seq_tokens"], 12900)
         self.assertEqual(out["gpu"]["name"], "NVIDIA GB10")
         self.assertAlmostEqual(out["gpu"]["pool_gb"], 71.34, places=2)
+
+    def test_power_block(self):
+        sys.path.insert(0, os.path.join(ROOT, "collect"))
+        import collector
+        metrics = {
+            "hardware": {"gpu_power": 40.0, "gpu_power_limit": 80.0},
+            "history": {"gpu_power": [10.0, 40.0, 30.0, None]},
+            "live": {"tok_s": 20.0},
+            "tiers": {"now": {}},
+        }
+        class FakeT:
+            path, counters, events = "/dev/null", {}, []
+        p = collector.compose(metrics, FakeT(), time.time())["power"]
+        self.assertEqual(p["gpu_w"], 40.0)
+        self.assertEqual(p["peak_w"], 40.0)
+        self.assertAlmostEqual(p["mean_w"], 80 / 3, places=2)
+        self.assertEqual(p["util_pct"], 50.0)          # 40 W of an 80 W cap
+        self.assertEqual(p["j_per_token"], 2.0)        # 40 W / 20 tok/s
+        self.assertEqual(p["tok_per_wh"], 1800.0)      # 20 tok/s * 3600 / 40 W
+        self.assertEqual(p["series"], [10.0, 40.0, 30.0])   # None dropped
+
+    def test_network_utilisation(self):
+        """rate = d(bytes)*8/dt; util% = rate / negotiated link bitrate."""
+        sys.path.insert(0, os.path.join(ROOT, "collect"))
+        import collector
+        ns = collector.NetSampler.__new__(collector.NetSampler)
+        ns.prev = {"eth9": (0, 0)}
+        ns.prev_t = time.time() - 1.0
+        ns.speeds = {"eth9": (1000.0, "sysfs", time.time())}
+        ns.speed_ttl = 1e9
+        ns.hist = {k: collections.deque(maxlen=4) for k in ("util", "rx_mbps", "tx_mbps")}
+        # 12.5 MB in 1 s = 100 Mbit/s = 10 % of a 1 Gbit/s link
+        ns._read_dev = staticmethod(lambda: {"eth9": (12_500_000, 1_250_000)})
+        d_if, d_sys = collector._default_ifaces, collector._sysfs
+        self.addCleanup(setattr, collector, "_default_ifaces", d_if)
+        self.addCleanup(setattr, collector, "_sysfs", d_sys)
+        collector._default_ifaces = lambda: ["eth9"]
+        collector._sysfs = lambda n, a: {"operstate": "up", "carrier": "1"}.get(a)
+        snap = ns.sample()
+        i = snap["ifaces"][0]
+        self.assertEqual(i["name"], "eth9")
+        self.assertAlmostEqual(i["rx_mbps"], 100.0, delta=1.0)
+        self.assertAlmostEqual(i["rx_pct"], 10.0, delta=0.2)
+        self.assertAlmostEqual(i["tx_pct"], 1.0, delta=0.1)
+        self.assertAlmostEqual(i["util_pct"], 10.0, delta=0.2)   # max(rx,tx)
+        self.assertEqual(snap["primary"], "eth9")
+        self.assertEqual(len(snap["history"]["util"]), 1)
+
+    def test_network_skips_virtual_and_down_links(self):
+        sys.path.insert(0, os.path.join(ROOT, "collect"))
+        import collector
+        for name in ("docker0", "br-f347fd986567", "veth1234"):
+            self.assertTrue(collector.SKIP_IFACE.match(name), name)
+        # lo is kept (engine API traffic rides it) but is never the primary link
+        for name in ("lo", "eth0", "enP7s7", "wlP9s9", "tailscale0"):
+            self.assertIsNone(collector.SKIP_IFACE.match(name), name)
+
+    def test_network_loopback_never_primary(self):
+        sys.path.insert(0, os.path.join(ROOT, "collect"))
+        import collector
+        ns = collector.NetSampler.__new__(collector.NetSampler)
+        ns.prev = {"lo": (0, 0), "eth9": (0, 0)}
+        ns.prev_t = time.time() - 1.0
+        ns.speeds = {"lo": (None, None, time.time()),
+                     "eth9": (1000.0, "sysfs", time.time())}
+        ns.speed_ttl = 1e9
+        ns.hist = {k: collections.deque(maxlen=4) for k in ("util", "rx_mbps", "tx_mbps")}
+        d_if, d_sys = collector._default_ifaces, collector._sysfs
+        self.addCleanup(setattr, collector, "_default_ifaces", d_if)
+        self.addCleanup(setattr, collector, "_sysfs", d_sys)
+        collector._default_ifaces = lambda: ["eth9"]
+        collector._sysfs = lambda n, a: {"operstate": "up", "carrier": "1"}.get(a)
+        # loopback busier than the NIC, yet the NIC stays primary
+        ns._read_dev = staticmethod(lambda: {"lo": (10**8, 10**8), "eth9": (10**5, 0)})
+        snap = ns.sample()
+        self.assertEqual(snap["primary"], "eth9")
+        lo = [i for i in snap["ifaces"] if i["name"] == "lo"][0]
+        self.assertEqual(lo["kind"], "loopback")
+        self.assertIsNone(lo["util_pct"])            # no link rate -> no %
+        self.assertEqual(snap["ifaces"][-1]["name"], "lo")   # sorted last
+        self.assertNotIn("lo", [i["name"] for i in snap["ifaces"][:1]])
+        self.assertAlmostEqual(snap["total_rx_mbps"], 0.8, delta=0.05)  # lo excluded
 
     def test_live_snapshot_valid_json(self):
         p = os.path.join(LIVE, "telemetry.json")

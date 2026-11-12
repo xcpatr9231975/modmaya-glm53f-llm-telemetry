@@ -5,7 +5,7 @@ import json, threading, time, urllib.request, urllib.error
 
 PORT, KEY = 8009, "sk-local"
 URL = f"http://127.0.0.1:{PORT}/v1/chat/completions"
-TEL = "http://100.81.58.85:8091/api/telemetry"
+TEL = "http://127.0.0.1:8091/api/telemetry"
 
 PROMPTS = [
     "Explain in detail how a transformer's grouped-query attention differs from multi-head attention, with concrete tensor shapes.",
@@ -41,6 +41,7 @@ while time.time() < stop:
     try:
         tel = json.loads(urllib.request.urlopen(TEL, timeout=2).read())
         live, hw = tel.get("live", {}), tel.get("hardware", {})
+        pw, net = tel.get("power", {}), tel.get("network", {})
         samples.append({
             "t": round(len(samples)*2, 1),
             "phase": live.get("phase"), "tok_s": live.get("tok_s"),
@@ -48,6 +49,10 @@ while time.time() < stop:
             "mtp": live.get("mtp_accept_rate"), "kv_seq": tel.get("kv", {}).get("seq_tokens"),
             "kv_res": tel.get("kv", {}).get("resident_tokens"), "gpu_util": hw.get("gpu_util"),
             "gpu_temp": hw.get("gpu_temp"), "cpu": hw.get("cpu"),
+            "power_w": pw.get("gpu_w"), "j_per_tok": pw.get("j_per_token"),
+            "net_iface": net.get("primary"), "net_link_mbit": net.get("link_mbit"),
+            "net_util_pct": net.get("util_pct"),
+            "net_rx_mbps": net.get("rx_mbps"), "net_tx_mbps": net.get("tx_mbps"),
         })
     except Exception: pass
     time.sleep(2)
